@@ -97,7 +97,7 @@ def train(model, moco, train_loader, valid_loader, optimizer, config, num_epochs
             moco_loss = 0
             optimizer.zero_grad()  
             predicted, moco_feature = model(inputs)  
-            if  i_moco and step < 2 :
+            if  i_moco and step < len(train_loader) :
                 moco_loss = moco(moco_feature,labels)
             labels = torch.argmax(labels.permute(0, 2, 1), dim=1).view(-1,).long()
             predicted = predicted.reshape(-1, 3)
