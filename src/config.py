@@ -31,7 +31,7 @@ class TrainGlobalConfig:
 
     # Training parameters
     num_epochs_pretrain = 100
-    num_epochs = 2  
+    num_epochs = 100  
     lr = 0.001  
     verbose = True  
     verbose_step = 1  
