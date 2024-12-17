@@ -4,18 +4,18 @@ import tqdm
 import numpy as np
 from pre_train import Valid
 from sklearn.model_selection import train_test_split
+import random
 
 def find_Pre_FoG_labels(loader, model, device,tn,tf):
     model.eval()
     index_list = []
     with torch.no_grad():
-        for batch_idx, (inputs, labels) in enumerate(tqdm.tqdm(loader, desc="Finding inconsistent labels")):
-            inputs, labels = inputs.to(device), labels.to(device)
+        for batch_idx, (inputs, labels, valid) in enumerate(tqdm.tqdm(loader, desc="Finding inconsistent labels")):
+            inputs, labels, valid = inputs.to(device), labels.to(device), valid.to(device)
             outputs,_ = model(inputs)
-
             for sample_idx in range(outputs.size(0)):
                 output = outputs[sample_idx].reshape(-1, 2)
-
+                valid_seq = valid[sample_idx]
                 max_vals, _ = output.max(dim=1, keepdim=True)
                 predicted_labels = output - max_vals
                 softmax = torch.nn.Softmax(dim=1)
@@ -26,79 +26,62 @@ def find_Pre_FoG_labels(loader, model, device,tn,tf):
 
                 for i in range(len(predicted_labels)):
                     normal = (true_labels[i].item()== 0)
-                    if normal:
-                        if  predicted_labels[i][0].item() <= tn :
-                            index_list.append((batch_idx * loader.batch_size + sample_idx, i)) 
-                    else:
-                        if  predicted_labels[i][1].item() <= tf:
-                            index_list.append((batch_idx * loader.batch_size + sample_idx, i))             
+                    if valid_seq[i] == 1:
+                        if normal:
+                            if  predicted_labels[i][0].item() <= tn :
+                                index_list.append((batch_idx * loader.batch_size + sample_idx, i)) 
+                        else:
+                            if  predicted_labels[i][1].item() <= tf:
+                                index_list.append((batch_idx * loader.batch_size + sample_idx, i))             
     return index_list
 
-def get_valid_indices(original_labels):
-    valid_indices = []
-    for center_idx in range(1, len(original_labels) - 1):  
-        if (
-            original_labels[center_idx][1] == 2 and
-            original_labels[center_idx - 1][1] == 1 and
-            original_labels[center_idx + 1][1] == 2
-        ):
-            valid_indices.append(center_idx)
-    return valid_indices
-
-def is_within_valid_range(valid_indices, target_idx):
-    if not valid_indices:
-        return False
-    
-    closest_indices = sorted(valid_indices, key=lambda x: abs(x - target_idx))
-
-    if len(closest_indices) < 2:
-        return False
-
-    for idx in closest_indices[:2]:
-        if abs(idx - target_idx) <= 576 or abs(idx - target_idx) <= 64:
-            return True
-
-    return False
-
-def modify_labels(data, index_list, stride=50):
+def modify_labels(data, index_list, stride=50, i_test=True):
     for idx in tqdm.tqdm(range(len(data)), desc="Expanding labels to 4 columns"):
         inputs, original_labels = data[idx]
         if original_labels.shape[1] == 3:
+            # Add a new column of zeros to expand labels to 4 columns
             expanded_labels = np.hstack((original_labels, np.zeros((original_labels.shape[0], 1))))
             data[idx] = (inputs, expanded_labels)
 
-
-    for global_idx, row_idx in tqdm.tqdm(index_list, desc="Modifying specified labels"):
-        data_idx = global_idx // data[0][0].shape[0]
-        local_sample_idx = global_idx % data[0][0].shape[0]
-
-        if data_idx >= len(data):
-            continue
-
+    for data_idx, row_idx in tqdm.tqdm(index_list, desc="Modifying specified labels"):
         inputs, labels = data[data_idx]
-        original_labels = labels[:, :3]
+        labels[row_idx] = [0, 0, 0, 1]
+        data[data_idx] = (inputs, labels)
+
+    pre_fog = []
+    fog = []
+    normal = []
+    for idx in tqdm.tqdm(range(len(data)), desc="Collecting samples with specific label conditions"):
+        if idx == 0 or idx > len(data) - 5:
+            continue
+        inputs, labels = data[idx]
         col_sum = np.sum(labels, axis=0)
 
-        if col_sum[2] != stride:
-            continue
+        for i in [1, 2, 3]:
+            if col_sum[i] >= stride // 2:
+                if i == 3:
+                    pre_fog.append((inputs, labels, 2))
+                elif i == 2:
+                    fog.append((inputs, labels, 1))
+                elif i == 1:
+                    normal.append((inputs, labels, 0))
+                break
 
-        valid_indices = get_valid_indices(original_labels)
+    fog.extend(pre_fog)
+    sample_size = len(fog) 
+    sampled_data = normal[:sample_size]
+    fog.extend(sampled_data)
 
-        if is_within_valid_range(valid_indices, row_idx):
-            labels[row_idx] = [0, 0, 0, 1]
-            data[data_idx] = (inputs, labels)
+    random.shuffle(fog)
+    total_length = 0.8 * len(fog)
+    train_count = int(0.8 * total_length)
+    validation_count = int(0.1 * total_length)
 
-    processed_data = []
-    for inputs, labels in tqdm.tqdm(data, desc="Calculating dominant labels"):
-        col_sum = np.sum(labels, axis=0)  
-        max_idx = np.argmax(col_sum[1:]) + 1  
-        n = max_idx  
-        processed_data.append((inputs, labels, n))
-    
-    train_data, temp_data = train_test_split(processed_data, test_size=0.2, random_state=2024)
-    valid_data, test_data = train_test_split(temp_data, test_size=0.5, random_state=2024)
+    train_set = fog[:train_count]
+    valid_set = fog[train_count:train_count + validation_count]
+    test_set = fog[train_count + validation_count:]
 
-    return train_data, valid_data, test_data
+    return train_set, valid_set, test_set
 
 
 def train(model, moco, train_loader, valid_loader, optimizer, config, num_epochs=50, i_moco=True):
@@ -114,7 +97,7 @@ def train(model, moco, train_loader, valid_loader, optimizer, config, num_epochs
             moco_loss = 0
             optimizer.zero_grad()  
             predicted, moco_feature = model(inputs)  
-            if  i_moco and step <5 :
+            if  i_moco and step < 2 :
                 moco_loss = moco(moco_feature,labels)
             labels = torch.argmax(labels.permute(0, 2, 1), dim=1).view(-1,).long()
             predicted = predicted.reshape(-1, 3)
@@ -131,6 +114,7 @@ def train(model, moco, train_loader, valid_loader, optimizer, config, num_epochs
         scheduler.step(val_loss)
         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Valid Loss: {val_loss:.4f}")
     torch.save(model.state_dict(), config.train_weight)
+
 
 
     

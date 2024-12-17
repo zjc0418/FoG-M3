@@ -59,6 +59,9 @@ def Pretrain(model, train_loader, valid_loader, optimizer, config, num_epochs):
     torch.save(model.state_dict(), config.pertrain_weight)
 
 
+
+
+
     
 
 
